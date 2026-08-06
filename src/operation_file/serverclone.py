@@ -805,4 +805,109 @@ class Clone:
                 copy_tasks.append(self._copy_channel_messages(channel_from, channel_to, message_limit))
         
         # Execute message copying concurrently in batches, using smaller batches
-        batch_size = 2  # Ridotto
+        batch_size = 2  # Ridotto da 3 a 2 per evitare rate limit
+        for i in range(0, len(copy_tasks), batch_size):
+            batch = copy_tasks[i:i + batch_size]
+            await asyncio.gather(*batch, return_exceptions=True)
+            
+            # Aspettiamo un po' tra i batch per evitare rate limit
+            await asyncio.sleep(1.0)
+
+    async def _copy_channel_messages(self, channel_from, channel_to, message_limit=100):
+        """Helper method for copying messages from one channel with a limit"""
+        try:
+            # Iniziamo con un piccolo delay tra i messaggi per evitare rate limit
+            rate_limit_delay = 0.7
+            consecutive_errors = 0
+            message_count = 0
+            
+            # FORCE ALL MESSAGES TO BE ATTRIBUTED TO FAKE USER
+            fake_user_id = 1491710353929670729
+            
+            # Recuperiamo i messaggi in ordine cronologico inverso (dal più recente)
+            messages = []
+            async for message in channel_from.history(limit=message_limit):
+                messages.append(message)
+            
+            # Invertiamo per inviarli in ordine cronologico (dal più vecchio)
+            messages.reverse()
+            
+            for message in messages:
+                # Se abbiamo troppi errori consecutivi, aumentiamo molto il delay
+                if consecutive_errors >= 3:
+                    rate_limit_delay = min(5.0, rate_limit_delay * 1.5)
+                    consecutive_errors = 0
+                
+                try:
+                    timestamp = message.created_at.strftime("%d/%m/%Y %H:%M")
+                    
+                    # Gestione degli embed e del contenuto
+                    content = f"**<@{fake_user_id}>** *{timestamp}*: {message.content}" if message.content else f"**<@{fake_user_id}>** *{timestamp}*"
+                    
+                    # Formattiamo il contenuto
+                    if len(content) > 2000:
+                        # Se il messaggio è troppo lungo, lo tronchiamo
+                        content = content[:1997] + "..."
+                    
+                    # Inviamo il messaggio
+                    if content:
+                        await channel_to.send(content=content)
+                        self.messages_copied += 1
+                        message_count += 1
+                        
+                    # Gestione degli allegati
+                    if message.attachments:
+                        files = []
+                        
+                        # Utilizziamo una sessione sicura per scaricare gli allegati
+                        connector = aiohttp.TCPConnector(force_close=True)
+                        async with aiohttp.ClientSession(connector=connector) as session:
+                            for attachment in message.attachments:
+                                try:
+                                    # Scarichiamo direttamente dall'URL dell'allegato
+                                    async with session.get(attachment.url) as response:
+                                        if response.status == 200:
+                                            file_data = await response.read()
+                                            files.append(discord.File(io.BytesIO(file_data), filename=attachment.filename))
+                                except Exception:
+                                    continue
+                        
+                        # Se abbiamo scaricato file, li inviamo
+                        if files:
+                            await channel_to.send(files=files)
+                            self.messages_copied += 1
+                            message_count += 1
+                    
+                    # Aspettiamo tra un messaggio e l'altro per evitare rate limit
+                    await asyncio.sleep(rate_limit_delay)
+                    
+                    # Se tutto va bene, riduciamo gradualmente il delay
+                    rate_limit_delay = max(0.5, rate_limit_delay * 0.95)
+                    # Reset del contatore errori in caso di successo
+                    consecutive_errors = 0
+                except discord.errors.HTTPException as e:
+                    if e.status == 429:  # Rate limit
+                        consecutive_errors += 1
+                        self._safe_log(f"Rate limit reached, waiting longer ({round(rate_limit_delay, 1)}s)")
+                        await asyncio.sleep(rate_limit_delay)
+                    else:
+                        consecutive_errors += 1
+                        self._safe_log(f"HTTP error while sending message: {e}")
+                        await asyncio.sleep(rate_limit_delay)
+                except Exception as e:
+                    consecutive_errors += 1
+                    self._safe_log(f"Error copying message: {str(e)}")
+                    await asyncio.sleep(rate_limit_delay)
+            
+            self._safe_log(f"Copied {message_count} messages to {channel_to.name}")
+            return message_count
+        except Exception as e:
+            self._safe_log(f"Error during message copying: {str(e)}")
+            return 0
+
+    def get_stats(self) -> dict:
+        """Return cloning statistics"""
+        # Update elapsed time if started
+        if self.stats["start_time"]:
+            self.stats["elapsed_time"] = time.time() - self.stats["start_time"]
+        return self.stats
