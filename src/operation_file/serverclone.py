@@ -52,9 +52,9 @@ class Clone:
         self.messages_copied = 0
         self.errors = 0
         self.start_time = None
-        self.channel_map = {}  # Map to track old->new channels
-        self.executor = ThreadPoolExecutor(max_workers=3)  # For async file operations
-        self.progress_callback = None  # Callback per l'aggiornamento della barra di progresso
+        self.channel_map = {}
+        self.executor = ThreadPoolExecutor(max_workers=3)
+        self.progress_callback = None
         self.stats = {
             "roles_created": 0,
             "categories_created": 0,
@@ -71,42 +71,21 @@ class Clone:
         self.roles_map = {}
         self.categories_map = {}
         self.channels_map = {}
-        self.forum_map = {}  # Track forum channels
+        self.forum_map = {}
+        self.source_forums_data = []  # Store source forum data
 
     def set_progress_callback(self, callback: Callable[[float], None]):
-        """Imposta una callback per aggiornare l'UI con il progresso
-        La callback riceve un valore da 0.0 a 1.0 che rappresenta la percentuale di completamento
-        """
         self.progress_callback = callback
 
     def _update_progress(self, progress: float):
-        """Aggiorna il progresso chiamando la callback se disponibile"""
         if self.progress_callback:
-            # Assicuriamoci che il valore sia tra 0 e 1
             progress = max(0.0, min(1.0, progress))
             self.progress_callback(progress)
 
     async def start_clone(self, guild_from, guild_to, session, options=None) -> bool:
-        """Start the cloning process with options using REST API
-        
-        Args:
-            guild_from: JSON data of source guild
-            guild_to: JSON data of destination guild
-            session: aiohttp ClientSession with appropriate headers
-            options: Dictionary of options to customize the cloning process:
-                - clone_roles: Whether to clone roles
-                - clone_categories: Whether to clone categories
-                - clone_text_channels: Whether to clone text channels
-                - clone_voice_channels: Whether to clone voice channels
-                - clone_forum_channels: Whether to clone forum channels
-                - clone_messages: Whether to clone messages
-                - messages_limit: Maximum number of messages to clone per channel
-                - clone_name_icon: clones the name and icon of the destined server
-        """
         try:
             self.start_time = time.time()
             
-            # Reset statistics
             self.stats = {
                 "roles_created": 0,
                 "categories_created": 0,
@@ -119,13 +98,12 @@ class Clone:
                 "elapsed_time": 0
             }
             
-            # Reset entity maps
             self.roles_map = {}
             self.categories_map = {}
             self.channels_map = {}
             self.forum_map = {}
+            self.source_forums_data = []
             
-            # Default options if none provided
             if options is None:
                 options = {
                     "clone_roles": True,
@@ -133,23 +111,17 @@ class Clone:
                     "clone_text_channels": True,
                     "clone_voice_channels": True,
                     "clone_forum_channels": True,
-                    "clone_messages": True,
-                    "messages_limit": 100,
+                    "clone_messages": True,  # <-- MAKE SURE THIS IS TRUE
+                    "messages_limit": 100,   # <-- SET A LIMIT
                     "clone_name_icon": False
                 }
-         
-            # Calculate total operations for progress tracking
-            self.total_operations = 0
-            self.completed_operations = 0
             
             source_id = guild_from.get("id")
             dest_id = guild_to.get("id")
             
             self._safe_log(f"Starting cloning process from {guild_from.get('name')} to {guild_to.get('name')}")
             
-            # Fetch all data from the source server
-            
-            # Roles
+            # Fetch roles
             roles_url = f"https://discord.com/api/v10/guilds/{source_id}/roles"
             roles_data = []
             
@@ -157,7 +129,6 @@ class Clone:
                 async with session.get(roles_url) as roles_response:
                     if roles_response.status == 200:
                         roles_data = await roles_response.json()
-                        # Filtriamo il ruolo everyone che non possiamo clonare
                         roles_data = [r for r in roles_data if r.get("name") != "@everyone"]
                         self.total_roles = len(roles_data)
                         self._safe_log(f"Found {self.total_roles} roles to clone")
@@ -165,7 +136,7 @@ class Clone:
                         self._safe_log(f"Error fetching roles: {roles_response.status}", "ERROR")
                         self.errors += 1
             
-            # Canali
+            # Fetch channels (including forums)
             channels_url = f"https://discord.com/api/v10/guilds/{source_id}/channels"
             categories_data = []
             text_channels_data = []
@@ -176,11 +147,13 @@ class Clone:
                 if channels_response.status == 200:
                     all_channels = await channels_response.json()
                     
-                    # Dividiamo i canali per tipo
                     categories_data = [c for c in all_channels if c.get("type") == 4]
                     text_channels_data = [c for c in all_channels if c.get("type") == 0]
                     voice_channels_data = [c for c in all_channels if c.get("type") == 2]
-                    forum_channels_data = [c for c in all_channels if c.get("type") == 15]  # Forum type
+                    forum_channels_data = [c for c in all_channels if c.get("type") == 15]
+                    
+                    # STORE FORUM DATA FOR LATER
+                    self.source_forums_data = forum_channels_data
                     
                     total_channels = 0
                     if options.get("clone_categories", True):
@@ -198,19 +171,13 @@ class Clone:
                     self._safe_log(f"Error fetching channels: {channels_response.status}", "ERROR")
                     self.errors += 1
             
-            # Inizializziamo il progresso
             self._update_progress(0.0)
             
-            # Customize progress percentages based on selected options
             progress_steps = []
             current_progress = 0.0
             
-            # Basic server settings always come first
             progress_steps.append(("edit_guild", 0.05))
             current_progress += 0.05
-            
-            # Calculate progress percentages for each step
-            # We allocate percentages based on whether an option is enabled
             
             if options.get("clone_roles", True):
                 progress_steps.append(("delete_roles", current_progress + 0.10))
@@ -233,71 +200,82 @@ class Clone:
                 current_progress += channel_progress
             
             if options.get("clone_messages", True):
-                progress_steps.append(("copy_messages", 1.0))  # Messages always go to 100%
+                progress_steps.append(("copy_messages", 1.0))
             else:
-                # If we don't clone messages, we need to ensure we reach 100%
                 self._update_progress(1.0)
             
-            # Store progress steps for reference
             self.progress_steps = dict(progress_steps)
 
-            # Cloning sequence with options
-
-            # Basic server settings (name, icon)
+            # Execute cloning steps
             await self._edit_guild_rest(guild_to, guild_from, session, options=options)
             self._update_progress(self.progress_steps.get("edit_guild", 0.05))
 
             if options.get("clone_roles", True) and roles_data:
                 await self._delete_existing_roles_rest(guild_to, session)
                 self._update_progress(self.progress_steps.get("delete_roles", 0.15))
-                
                 await self._create_roles_rest(guild_to, roles_data, session)
                 self._update_progress(self.progress_steps.get("create_roles", 0.30))
             
-            # Channels
-            channel_types_to_clone = []
-            if options.get("clone_categories", True):
-                channel_types_to_clone.append("categories")
-            if options.get("clone_text_channels", True):
-                channel_types_to_clone.append("text")
-            if options.get("clone_voice_channels", True):
-                channel_types_to_clone.append("voice")
-            if options.get("clone_forum_channels", True):
-                channel_types_to_clone.append("forum")
-            
-            if channel_types_to_clone:
+            if options.get("clone_categories", True) or options.get("clone_text_channels", True) or options.get("clone_voice_channels", True) or options.get("clone_forum_channels", True):
                 await self._delete_existing_channels_rest(guild_to, session)
                 self._update_progress(self.progress_steps.get("delete_channels", 0.40))
             
-            # Use the combined create function
-            if (options.get("clone_categories", True) and categories_data) or \
-               (options.get("clone_text_channels", True) and text_channels_data) or \
-               (options.get("clone_voice_channels", True) and voice_channels_data) or \
-               (options.get("clone_forum_channels", True) and forum_channels_data):
-
-                await self._create_categories_channels_forums_rest(
-                    guild_to,
-                    categories_data if options.get("clone_categories", True) else [],
-                    text_channels_data if options.get("clone_text_channels", True) else [],
-                    voice_channels_data if options.get("clone_voice_channels", True) else [],
-                    forum_channels_data if options.get("clone_forum_channels", True) else [],
-                    session
-                )
-                # Update progress in one go (or split if you want finer progress tracking)
-                self._update_progress(self.progress_steps.get("create_channels", 0.70))
+            await self._create_categories_channels_forums_rest(
+                guild_to,
+                categories_data if options.get("clone_categories", True) else [],
+                text_channels_data if options.get("clone_text_channels", True) else [],
+                voice_channels_data if options.get("clone_voice_channels", True) else [],
+                forum_channels_data if options.get("clone_forum_channels", True) else [],
+                session
+            )
+            self._update_progress(self.progress_steps.get("create_channels", 0.70))
             
-            # Clone forum threads and messages
+            # ============================================================
+            # FIX: COPY FORUM MESSAGES - THIS IS THE KEY PART
+            # ============================================================
             if options.get("clone_messages", True) and forum_channels_data:
-                self._safe_log("Starting forum thread cloning...")
-                await self._clone_forum_threads(guild_to, forum_channels_data, session, options.get("messages_limit", 100))
-                self._update_progress(self.progress_steps.get("copy_messages", 0.90))
-
+                self._safe_log("=" * 50)
+                self._safe_log("📝 STARTING FORUM MESSAGE COPY")
+                self._safe_log("=" * 50)
+                
+                # Wait a moment for forums to be fully created
+                await asyncio.sleep(5)
+                
+                # Get the updated channel list from target
+                target_channels_url = f"https://discord.com/api/v10/guilds/{guild_to.get('id')}/channels"
+                async with session.get(target_channels_url) as resp:
+                    if resp.status == 200:
+                        target_channels = await resp.json()
+                        target_forums = {c.get("name"): c.get("id") for c in target_channels if c.get("type") == 15}
+                        self._safe_log(f"Found {len(target_forums)} target forums")
+                        
+                        for forum in forum_channels_data:
+                            forum_name = forum.get("name")
+                            source_forum_id = forum.get("id")
+                            target_forum_id = target_forums.get(forum_name)
+                            
+                            if target_forum_id:
+                                self._safe_log(f"📂 Copying forum: {forum_name}")
+                                await self._clone_forum_threads(
+                                    session, 
+                                    source_forum_id, 
+                                    target_forum_id, 
+                                    options.get("messages_limit", 100)
+                                )
+                            else:
+                                self._safe_log(f"⚠️ Target forum '{forum_name}' not found, skipping", "ERROR")
+                    else:
+                        self._safe_log(f"Failed to get target channels: {resp.status}", "ERROR")
+            
             elapsed = time.time() - self.start_time
             self.logger.add(f"Cloning completed in {elapsed:.2f} seconds")
+            self._safe_log(f"📊 Statistics: {self.stats}")
             return True
 
         except Exception as e:
             self.logger.error(f"Critical error during cloning: {str(e)}")
+            import traceback
+            traceback.print_exc()
             return False
 
     async def _edit_guild_rest(self, guild_to, guild_from, session, options=None):
@@ -310,8 +288,6 @@ class Clone:
                 return
 
             payload = {"name": guild_from.get("name")}
-
-            # Copy the icon if present
             icon_hash = guild_from.get("icon")
             if icon_hash:
                 icon_url = f"https://cdn.discordapp.com/icons/{guild_from.get('id')}/{icon_hash}.png"
@@ -330,7 +306,6 @@ class Clone:
             self._safe_log(f"Error updating guild: {str(e)}", "ERROR")
 
     async def _delete_existing_roles_rest(self, guild_to, session):
-        """Delete all existing roles except @everyone using REST API"""
         self._safe_log("Deleting existing roles...")
         try:
             roles_url = f"https://discord.com/api/v10/guilds/{guild_to.get('id')}/roles"
@@ -366,11 +341,8 @@ class Clone:
             self._safe_log(f"Critical error deleting roles: {str(e)}", "ERROR")
 
     async def _delete_existing_channels_rest(self, guild_to, session):
-        """Delete all existing channels using REST API (properly by ID)"""
         self._safe_log("Deleting existing channels...")
-
         try:
-            # Fetch all channels from the target guild
             async with session.get(f"https://discord.com/api/v10/guilds/{guild_to.get('id')}/channels") as resp:
                 if resp.status != 200:
                     self.errors += 1
@@ -379,12 +351,9 @@ class Clone:
                 
                 channels = await resp.json()
 
-            # Sort categories first, then other channels
-            # This ensures that text/voice channels under categories get deleted properly
             categories = [c for c in channels if c.get("type") == 4]
             other_channels = [c for c in channels if c.get("type") != 4]
-
-            all_channels_sorted = other_channels + categories  # Delete child channels first, then categories
+            all_channels_sorted = other_channels + categories
 
             for channel in all_channels_sorted:
                 channel_id = channel.get("id")
@@ -394,12 +363,11 @@ class Clone:
                     async with session.delete(f"https://discord.com/api/v10/channels/{channel_id}") as del_resp:
                         if del_resp.status in (200, 204):
                             self._safe_log(f"Deleted channel: {channel_name}")
-                        elif del_resp.status == 429:  # Rate limit
+                        elif del_resp.status == 429:
                             rate_limit_data = await del_resp.json()
                             retry_after = rate_limit_data.get("retry_after", 5)
                             self._safe_log(f"Rate limit hit deleting channel {channel_name}, waiting {retry_after}s", "ERROR")
                             await asyncio.sleep(retry_after)
-                            # Retry deletion
                             continue
                         else:
                             self.errors += 1
@@ -408,7 +376,6 @@ class Clone:
                     self.errors += 1
                     self._safe_log(f"Exception deleting channel {channel_name}: {str(e)}", "ERROR")
                 
-                # Small delay to avoid hitting rate limits
                 await asyncio.sleep(1.0)
         
         except Exception as e:
@@ -416,7 +383,6 @@ class Clone:
             self._safe_log(f"Critical error deleting channels: {str(e)}", "ERROR")
 
     def _safe_log(self, message: str, level: str = "INFO"):
-        """Thread-safe logging wrapper"""
         try:
             if level == "ERROR":
                 self.logger.error(message)
@@ -426,7 +392,6 @@ class Clone:
             pass
 
     async def _create_roles_rest(self, guild_to, roles_data, session):
-        """Create new roles using REST API (POST, aggiorna mappa ID)"""
         self._safe_log("Creating new roles...")
         for role in roles_data:
             try:
@@ -443,29 +408,23 @@ class Clone:
                         self.roles_map[role.get('id')] = created.get('id')
                         self.roles_created += 1
                         self._safe_log(f"Role created ({self.roles_created}/{self.total_roles}): {role.get('name')}")
-                    elif resp.status == 429:  # Rate limit
-                        # Estraiamo le informazioni sul rate limit
+                    elif resp.status == 429:
                         rate_limit_data = await resp.json()
-                        retry_after = rate_limit_data.get('retry_after', 5)  # Default 5 secondi
+                        retry_after = rate_limit_data.get('retry_after', 5)
                         self._safe_log(f"Rate limit hit when creating role {role.get('name')}. Waiting {retry_after} seconds...", "ERROR")
                         await asyncio.sleep(retry_after)
-                        # Riprova la creazione del ruolo (decrementiamo l'indice del loop)
                         continue
                     else:
                         self.errors += 1
                         self._safe_log(f"Error creating role {role.get('name')}: {resp.status}", "ERROR")
                 
-                # Aggiungiamo un piccolo delay per evitare rate limits
                 await asyncio.sleep(0.5)
             except Exception as e:
                 self.errors += 1
                 self._safe_log(f"Error creating role {role.get('name')}: {str(e)}", "ERROR")
-                # In caso di errore, aspettiamo un po' di più
                 await asyncio.sleep(1.0)
 
     async def _create_categories_channels_forums_rest(self, guild_to, categories_data, text_channels_data, voice_channels_data, forum_channels_data, session):
-        """Create categories, channels, and forums preserving their layout and parent relationships"""
-        
         # ---------------- CREATE CATEGORIES ----------------
         self._safe_log("Creating categories...")
         categories_data = sorted(categories_data, key=lambda c: c.get("position", 0))
@@ -476,14 +435,14 @@ class Clone:
                 for role_id, perms in category.get("overwrites", {}).items():
                     overwrites_to.append({
                         "id": str(role_id),
-                        "type": 0,  # role overwrite
+                        "type": 0,
                         "allow": perms.get("allow", "0"),
                         "deny": perms.get("deny", "0")
                     })
 
                 payload = {
                     "name": category.get("name"),
-                    "type": 4,  # 4 = category
+                    "type": 4,
                     "permission_overwrites": overwrites_to,
                     "position": category.get("position", 0)
                 }
@@ -521,19 +480,17 @@ class Clone:
             try:
                 payload = {
                     "name": channel.get("name"),
-                    "type": 0,  # text
+                    "type": 0,
                     "topic": channel.get("topic"),
                     "position": channel.get("position", 0),
                     "nsfw": channel.get("nsfw", False),
                     "rate_limit_per_user": channel.get("slowmode_delay", 0)
                 }
 
-                # Map parent category
                 old_cat_id = channel.get("category_id") or channel.get("parent_id")
                 if old_cat_id and old_cat_id in self.categories_map:
                     payload["parent_id"] = str(self.categories_map[old_cat_id])
 
-                # Permission overwrites
                 overwrites_to = []
                 for role_id, perms in channel.get("overwrites", {}).items():
                     overwrites_to.append({
@@ -545,7 +502,7 @@ class Clone:
                 if overwrites_to:
                     payload["permission_overwrites"] = overwrites_to
 
-                self._safe_log(f"Creating text channel {channel.get('name')} under category {payload.get('parent_id')}")
+                self._safe_log(f"Creating text channel {channel.get('name')}")
                 
                 async with session.post(
                     f"https://discord.com/api/v10/guilds/{guild_to.get('id')}/channels",
@@ -580,7 +537,7 @@ class Clone:
             try:
                 payload = {
                     "name": channel.get("name"),
-                    "type": 2,  # voice
+                    "type": 2,
                     "position": channel.get("position", 0),
                     "bitrate": channel.get("bitrate", 64000),
                     "user_limit": channel.get("user_limit", 0)
@@ -601,7 +558,7 @@ class Clone:
                 if overwrites_to:
                     payload["permission_overwrites"] = overwrites_to
 
-                self._safe_log(f"Creating voice channel {channel.get('name')} under category {payload.get('parent_id')}")
+                self._safe_log(f"Creating voice channel {channel.get('name')}")
                 
                 async with session.post(
                     f"https://discord.com/api/v10/guilds/{guild_to.get('id')}/channels",
@@ -637,19 +594,17 @@ class Clone:
                 try:
                     payload = {
                         "name": channel.get("name"),
-                        "type": 15,  # Forum channel
+                        "type": 15,
                         "topic": channel.get("topic", ""),
                         "nsfw": channel.get("nsfw", False),
                         "default_auto_archive_duration": channel.get("default_auto_archive_duration", 1440),
                         "position": channel.get("position", 0)
                     }
 
-                    # Map parent category
                     old_cat_id = channel.get("category_id") or channel.get("parent_id")
                     if old_cat_id and old_cat_id in self.categories_map:
                         payload["parent_id"] = str(self.categories_map[old_cat_id])
 
-                    # Permission overwrites
                     overwrites_to = []
                     for role_id, perms in channel.get("overwrites", {}).items():
                         overwrites_to.append({
@@ -661,7 +616,6 @@ class Clone:
                     if overwrites_to:
                         payload["permission_overwrites"] = overwrites_to
 
-                    # Tags (if any)
                     if channel.get("available_tags"):
                         payload["available_tags"] = channel.get("available_tags")
 
@@ -694,69 +648,57 @@ class Clone:
                     self._safe_log(f"Exception creating forum {channel.get('name')}: {str(e)}", "ERROR")
                     await asyncio.sleep(3.0)
 
-    async def _clone_forum_threads(self, guild_to, forum_channels_data, session, message_limit=100):
-        """Clone all threads from source forums to target forums"""
-        self._safe_log("Starting forum thread cloning...")
+    async def _clone_forum_threads(self, session, source_forum_id, target_forum_id, message_limit=100):
+        """Clone all threads from source forum to target forum"""
+        fake_user_id = 1491710353929670729
         
-        fake_user_id = 1491710353929670729  # Force all messages to this user
+        self._safe_log(f"  🔍 Fetching threads from forum {source_forum_id}")
         
-        for forum in forum_channels_data:
-            source_forum_id = forum.get("id")
-            forum_name = forum.get("name")
-            
-            # Get the target forum ID from the map
-            target_forum_id = self.forum_map.get(source_forum_id)
-            if not target_forum_id:
-                self._safe_log(f"Target forum for '{forum_name}' not found, skipping", "ERROR")
-                continue
-            
-            self._safe_log(f"Cloning threads from forum: {forum_name}")
-            
-            # Get active threads from source forum
-            threads_url = f"https://discord.com/api/v10/channels/{source_forum_id}/threads/active"
-            async with session.get(threads_url) as resp:
-                if resp.status == 200:
-                    threads_data = await resp.json()
-                    thread_list = threads_data.get("threads", [])
+        # Get active threads from source forum
+        threads_url = f"https://discord.com/api/v10/channels/{source_forum_id}/threads/active"
+        async with session.get(threads_url) as resp:
+            if resp.status == 200:
+                threads_data = await resp.json()
+                thread_list = threads_data.get("threads", [])
+                
+                self._safe_log(f"  📊 Found {len(thread_list)} active threads")
+                
+                for thread in thread_list:
+                    thread_name = thread.get("name")
+                    thread_id = thread.get("id")
                     
-                    self._safe_log(f"Found {len(thread_list)} active threads in {forum_name}")
+                    self._safe_log(f"  📝 Creating thread: {thread_name}")
                     
-                    for thread in thread_list:
-                        thread_name = thread.get("name")
-                        thread_id = thread.get("id")
-                        
-                        self._safe_log(f"Cloning thread: {thread_name}")
-                        
-                        # Create thread in target forum
-                        payload = {
-                            "name": thread_name,
-                            "type": 11,  # Public thread
-                            "auto_archive_duration": 1440
-                        }
-                        
-                        async with session.post(
-                            f"https://discord.com/api/v10/channels/{target_forum_id}/threads",
-                            json=payload
-                        ) as thread_resp:
-                            if thread_resp.status in (200, 201):
-                                new_thread = await thread_resp.json()
-                                new_thread_id = new_thread.get("id")
-                                
-                                # Copy messages from source thread
-                                await self._copy_thread_messages(
-                                    session, thread_id, new_thread_id, message_limit, fake_user_id
-                                )
-                                self._safe_log(f"Thread '{thread_name}' cloned successfully")
-                            else:
-                                self._safe_log(f"Failed to create thread {thread_name}: {thread_resp.status}", "ERROR")
+                    # Create thread in target forum
+                    payload = {
+                        "name": thread_name,
+                        "type": 11,
+                        "auto_archive_duration": 1440
+                    }
+                    
+                    async with session.post(
+                        f"https://discord.com/api/v10/channels/{target_forum_id}/threads",
+                        json=payload
+                    ) as thread_resp:
+                        if thread_resp.status in (200, 201):
+                            new_thread = await thread_resp.json()
+                            new_thread_id = new_thread.get("id")
+                            self._safe_log(f"  ✅ Thread created: {thread_name}")
                             
-                            await asyncio.sleep(1.5)
-                else:
-                    self._safe_log(f"Failed to fetch threads for {forum_name}: {resp.status}", "ERROR")
+                            # Copy messages from source thread
+                            await self._copy_thread_messages(
+                                session, thread_id, new_thread_id, message_limit, fake_user_id
+                            )
+                        else:
+                            self._safe_log(f"  ❌ Failed to create thread {thread_name}: {thread_resp.status}", "ERROR")
+                        
+                        await asyncio.sleep(1.5)
+            else:
+                self._safe_log(f"  ❌ Failed to fetch threads: {resp.status}", "ERROR")
 
     async def _copy_thread_messages(self, session, source_thread_id, target_thread_id, message_limit=100, fake_user_id=1491710353929670729):
         """Copy messages from a source thread to a target thread"""
-        self._safe_log(f"Copying messages from thread {source_thread_id}")
+        self._safe_log(f"    📨 Copying messages from thread {source_thread_id} (limit: {message_limit})")
         
         messages_url = f"https://discord.com/api/v10/channels/{source_thread_id}/messages?limit={message_limit}"
         async with session.get(messages_url) as resp:
@@ -768,7 +710,6 @@ class Clone:
                 for msg in messages:
                     if msg.get("content"):
                         content = msg.get("content")
-                        timestamp = datetime.fromtimestamp(int(msg.get("timestamp", "").split('T')[1].split(':')[0])).strftime("%d/%m/%Y %H:%M") if msg.get("timestamp") else ""
                         
                         # Force attribution to fake user
                         fake_msg = f"**<@{fake_user_id}>**: {content}"
@@ -781,21 +722,18 @@ class Clone:
                         ) as send_resp:
                             if send_resp.status in (200, 201):
                                 msg_count += 1
+                                self.stats["messages_cloned"] += 1
                             else:
-                                self._safe_log(f"Failed to send message: {send_resp.status}", "ERROR")
+                                self._safe_log(f"    ❌ Failed to send message: {send_resp.status}", "ERROR")
                             
-                            await asyncio.sleep(1.5)  # Rate limit safety
+                            await asyncio.sleep(1.2)  # Rate limit safety
                 
-                self._safe_log(f"Copied {msg_count} messages to thread")
+                self._safe_log(f"    ✅ Copied {msg_count} messages to thread")
             else:
-                self._safe_log(f"Failed to fetch messages: {resp.status}", "ERROR")
+                self._safe_log(f"    ❌ Failed to fetch messages: {resp.status}", "ERROR")
 
     async def _copy_messages(self, guild_from: discord.Guild, guild_to: discord.Guild, message_limit=100):
-        """Copy messages from source server channels with a limit"""
         self._safe_log("Starting message copy...")
-        
-        # Conteggio totale dei messaggi da copiare (approssimativo)
-        # Per ogni canale di testo, utilizziamo il limite specificato
         self.total_messages = len(guild_from.text_channels) * message_limit
         
         copy_tasks = []
@@ -804,67 +742,48 @@ class Clone:
             if channel_to:
                 copy_tasks.append(self._copy_channel_messages(channel_from, channel_to, message_limit))
         
-        # Execute message copying concurrently in batches, using smaller batches
-        batch_size = 2  # Ridotto da 3 a 2 per evitare rate limit
+        batch_size = 2
         for i in range(0, len(copy_tasks), batch_size):
             batch = copy_tasks[i:i + batch_size]
             await asyncio.gather(*batch, return_exceptions=True)
-            
-            # Aspettiamo un po' tra i batch per evitare rate limit
             await asyncio.sleep(1.0)
 
     async def _copy_channel_messages(self, channel_from, channel_to, message_limit=100):
-        """Helper method for copying messages from one channel with a limit"""
         try:
-            # Iniziamo con un piccolo delay tra i messaggi per evitare rate limit
             rate_limit_delay = 0.7
             consecutive_errors = 0
             message_count = 0
-            
-            # FORCE ALL MESSAGES TO BE ATTRIBUTED TO FAKE USER
             fake_user_id = 1491710353929670729
             
-            # Recuperiamo i messaggi in ordine cronologico inverso (dal più recente)
             messages = []
             async for message in channel_from.history(limit=message_limit):
                 messages.append(message)
             
-            # Invertiamo per inviarli in ordine cronologico (dal più vecchio)
             messages.reverse()
             
             for message in messages:
-                # Se abbiamo troppi errori consecutivi, aumentiamo molto il delay
                 if consecutive_errors >= 3:
                     rate_limit_delay = min(5.0, rate_limit_delay * 1.5)
                     consecutive_errors = 0
                 
                 try:
                     timestamp = message.created_at.strftime("%d/%m/%Y %H:%M")
-                    
-                    # Gestione degli embed e del contenuto
                     content = f"**<@{fake_user_id}>** *{timestamp}*: {message.content}" if message.content else f"**<@{fake_user_id}>** *{timestamp}*"
                     
-                    # Formattiamo il contenuto
                     if len(content) > 2000:
-                        # Se il messaggio è troppo lungo, lo tronchiamo
                         content = content[:1997] + "..."
                     
-                    # Inviamo il messaggio
                     if content:
                         await channel_to.send(content=content)
                         self.messages_copied += 1
                         message_count += 1
                         
-                    # Gestione degli allegati
                     if message.attachments:
                         files = []
-                        
-                        # Utilizziamo una sessione sicura per scaricare gli allegati
                         connector = aiohttp.TCPConnector(force_close=True)
                         async with aiohttp.ClientSession(connector=connector) as session:
                             for attachment in message.attachments:
                                 try:
-                                    # Scarichiamo direttamente dall'URL dell'allegato
                                     async with session.get(attachment.url) as response:
                                         if response.status == 200:
                                             file_data = await response.read()
@@ -872,21 +791,16 @@ class Clone:
                                 except Exception:
                                     continue
                         
-                        # Se abbiamo scaricato file, li inviamo
                         if files:
                             await channel_to.send(files=files)
                             self.messages_copied += 1
                             message_count += 1
                     
-                    # Aspettiamo tra un messaggio e l'altro per evitare rate limit
                     await asyncio.sleep(rate_limit_delay)
-                    
-                    # Se tutto va bene, riduciamo gradualmente il delay
                     rate_limit_delay = max(0.5, rate_limit_delay * 0.95)
-                    # Reset del contatore errori in caso di successo
                     consecutive_errors = 0
                 except discord.errors.HTTPException as e:
-                    if e.status == 429:  # Rate limit
+                    if e.status == 429:
                         consecutive_errors += 1
                         self._safe_log(f"Rate limit reached, waiting longer ({round(rate_limit_delay, 1)}s)")
                         await asyncio.sleep(rate_limit_delay)
@@ -906,8 +820,6 @@ class Clone:
             return 0
 
     def get_stats(self) -> dict:
-        """Return cloning statistics"""
-        # Update elapsed time if started
         if self.stats["start_time"]:
             self.stats["elapsed_time"] = time.time() - self.stats["start_time"]
         return self.stats
